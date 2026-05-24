@@ -246,6 +246,12 @@ enum ResponseSettings {
     static let notInterestedDefault = "Not interested at this time"
 }
 
+enum ConnecteamSettings {
+    static let apiKeyKey = "connecteam.apiKey"
+    static let taskBoardIDKey = "connecteam.taskBoardID"
+    static let userIDsKey = "connecteam.userIDs"
+}
+
 @MainActor
 final class ThreadTriageStore: ObservableObject {
     @Published var threads: [MessageThread] = MessageThread.samples
@@ -812,6 +818,139 @@ final class ContactNameResolver {
     }
 }
 
+struct ContactRecipient: Identifiable, Hashable {
+    let id: String
+    let name: String
+    let handle: String
+    let detail: String
+
+    var displayLabel: String {
+        detail.isEmpty ? name : "\(name) - \(detail)"
+    }
+}
+
+enum ContactRecipientError: LocalizedError {
+    case denied
+    case loadFailed(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .denied:
+            return "Allow Contacts access to select a recipient."
+        case .loadFailed(let message):
+            return "Could not load contacts: \(message)"
+        }
+    }
+}
+
+@MainActor
+final class ContactRecipientStore: ObservableObject {
+    @Published private(set) var recipients: [ContactRecipient] = []
+    @Published private(set) var isLoading = false
+    @Published var errorMessage: String?
+
+    private let store = CNContactStore()
+
+    func load() {
+        guard !isLoading else { return }
+        isLoading = true
+        errorMessage = nil
+        let contactStore = store
+
+        Task {
+            do {
+                recipients = try await Task.detached {
+                    try Self.loadRecipients(store: contactStore)
+                }.value
+            } catch {
+                errorMessage = error.localizedDescription
+            }
+
+            isLoading = false
+        }
+    }
+
+    nonisolated private static func loadRecipients(store: CNContactStore) throws -> [ContactRecipient] {
+        let status = CNContactStore.authorizationStatus(for: .contacts)
+        if status == .notDetermined {
+            let semaphore = DispatchSemaphore(value: 0)
+            var granted = false
+            store.requestAccess(for: .contacts) { didGrantAccess, _ in
+                granted = didGrantAccess
+                semaphore.signal()
+            }
+            semaphore.wait()
+            guard granted else { throw ContactRecipientError.denied }
+        } else if status != .authorized {
+            throw ContactRecipientError.denied
+        }
+
+        let keys: [CNKeyDescriptor] = [
+            CNContactFormatter.descriptorForRequiredKeys(for: .fullName),
+            CNContactNicknameKey as CNKeyDescriptor,
+            CNContactOrganizationNameKey as CNKeyDescriptor,
+            CNContactEmailAddressesKey as CNKeyDescriptor,
+            CNContactPhoneNumbersKey as CNKeyDescriptor
+        ]
+        let request = CNContactFetchRequest(keysToFetch: keys)
+        var recipients: [ContactRecipient] = []
+
+        do {
+            try store.enumerateContacts(with: request) { contact, _ in
+                let name = displayName(for: contact)
+
+                for phoneNumber in contact.phoneNumbers {
+                    let handle = phoneNumber.value.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !handle.isEmpty else { continue }
+                    recipients.append(
+                        ContactRecipient(
+                            id: "phone-\(contact.identifier)-\(handle)",
+                            name: name,
+                            handle: handle,
+                            detail: phoneNumber.label.flatMap(CNLabeledValue<NSString>.localizedString(forLabel:)) ?? "Phone"
+                        )
+                    )
+                }
+
+                for emailAddress in contact.emailAddresses {
+                    let handle = String(emailAddress.value).trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !handle.isEmpty else { continue }
+                    recipients.append(
+                        ContactRecipient(
+                            id: "email-\(contact.identifier)-\(handle)",
+                            name: name,
+                            handle: handle,
+                            detail: emailAddress.label.flatMap(CNLabeledValue<NSString>.localizedString(forLabel:)) ?? "Email"
+                        )
+                    )
+                }
+            }
+        } catch {
+            throw ContactRecipientError.loadFailed(error.localizedDescription)
+        }
+
+        return recipients.sorted {
+            $0.displayLabel.localizedCaseInsensitiveCompare($1.displayLabel) == .orderedAscending
+        }
+    }
+
+    nonisolated private static func displayName(for contact: CNContact) -> String {
+        if let fullName = CNContactFormatter.string(from: contact, style: .fullName), !fullName.isEmpty {
+            return fullName
+        }
+
+        if !contact.nickname.isEmpty {
+            return contact.nickname
+        }
+
+        if !contact.organizationName.isEmpty {
+            return contact.organizationName
+        }
+
+        return "Unnamed Contact"
+    }
+}
+
 enum ThreadClassifier {
     static func classify(id: String, name: String, participants: [String], replyHandles: [String], replyService: String, messages: [ThreadMessage]) -> MessageThread {
         let combined = messages.map(\.text).joined(separator: " ")
@@ -1123,6 +1262,9 @@ struct ResponseSettingsView: View {
     @AppStorage(ResponseSettings.noKey) private var noMessage = ResponseSettings.noDefault
     @AppStorage(ResponseSettings.interestedKey) private var interestedMessage = ResponseSettings.interestedDefault
     @AppStorage(ResponseSettings.notInterestedKey) private var notInterestedMessage = ResponseSettings.notInterestedDefault
+    @AppStorage(ConnecteamSettings.apiKeyKey) private var connecteamAPIKey = ""
+    @AppStorage(ConnecteamSettings.taskBoardIDKey) private var connecteamTaskBoardID = ""
+    @AppStorage(ConnecteamSettings.userIDsKey) private var connecteamUserIDs = ""
 
     var body: some View {
         Form {
@@ -1152,6 +1294,28 @@ struct ResponseSettingsView: View {
                     .lineLimit(2...4)
             }
 
+            Section("Connecteam") {
+                HStack {
+                    SecureField("API Key", text: $connecteamAPIKey)
+                        .textContentType(.password)
+                    Button("Paste") {
+                        connecteamAPIKey = pasteboardText()
+                    }
+                }
+
+                HStack {
+                    TextField("Task Board ID", text: $connecteamTaskBoardID)
+                    Button("Paste") {
+                        connecteamTaskBoardID = pasteboardText()
+                    }
+                }
+
+                TextField("Fallback User IDs", text: $connecteamUserIDs)
+                Text("ThreadPilot looks up the Connecteam assignee from the contact you select in Discuss. Optional fallback user IDs are used when that lookup does not find a match. If neither exists, ThreadPilot shows the API error.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
             Section {
                 Button("Restore Defaults") {
                     approveMessage = ResponseSettings.approveDefault
@@ -1170,6 +1334,11 @@ struct ResponseSettingsView: View {
         .formStyle(.grouped)
         .frame(width: 520)
         .padding()
+    }
+
+    private func pasteboardText() -> String {
+        NSPasteboard.general.string(forType: .string)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     }
 }
 
@@ -1313,8 +1482,13 @@ enum HelpContent {
         ),
         HelpEntry(
             title: "Quick Responses",
-            keywords: ["approve", "reject", "completed", "working", "yes", "no", "interested", "dismiss"],
-            body: "Quick responses are available based on the thread category. Action Required includes approval and status responses. Opportunities includes Interested and Not Interested. Noise includes Respond and Dismiss. Sending or dismissing a thread marks it as read."
+            keywords: ["approve", "reject", "completed", "working", "yes", "no", "interested", "dismiss", "discuss"],
+            body: "Quick responses are available based on the thread category. Action Required includes approval, status responses, and Discuss. Opportunities includes Interested and Not Interested. Noise includes Respond and Dismiss. Sending or dismissing a thread marks it as read."
+        ),
+        HelpEntry(
+            title: "Discuss And Connecteam",
+            keywords: ["discuss", "connecteam", "task", "api key", "contacts", "settings"],
+            body: "Discuss opens a compose dialog where you can type or dictate a message and select a recipient from Contacts. OK sends the message to that contact, looks up the matching Connecteam user by phone number or email, creates a Connecteam quick task assigned to that user, and marks the original thread as read. Add the Connecteam API key and task board ID in Settings. Optional fallback user IDs are used when contact lookup does not find a Connecteam user. API failures show a popup with the response message."
         ),
         HelpEntry(
             title: "Custom Responses And Dictation",
@@ -1885,6 +2059,135 @@ struct CustomResponseSheet: View {
     }
 }
 
+struct DiscussResponseSheet: View {
+    @Binding var message: String
+    @Binding var selectedRecipient: ContactRecipient?
+    let isSending: Bool
+    let onCancel: () -> Void
+    let onSend: () -> Void
+    @StateObject private var contacts = ContactRecipientStore()
+    @StateObject private var dictation = DictationController()
+    @State private var contactSearchText = ""
+
+    private var filteredRecipients: [ContactRecipient] {
+        let query = contactSearchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return contacts.recipients }
+
+        return contacts.recipients.filter {
+            $0.name.localizedCaseInsensitiveContains(query)
+                || $0.handle.localizedCaseInsensitiveContains(query)
+                || $0.detail.localizedCaseInsensitiveContains(query)
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("Discuss")
+                .font(.title2.weight(.semibold))
+
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Message")
+                    .font(.headline)
+                TextEditor(text: $message)
+                    .frame(width: 520, height: 150)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 6)
+                            .stroke(.quaternary)
+                    )
+            }
+
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Send To Contact")
+                    .font(.headline)
+
+                TextField("Search contacts", text: $contactSearchText)
+
+                HStack(spacing: 10) {
+                    Picker("Contact", selection: $selectedRecipient) {
+                        Text("Select a contact").tag(nil as ContactRecipient?)
+                        ForEach(filteredRecipients) { recipient in
+                            Text(recipient.displayLabel).tag(Optional(recipient))
+                        }
+                    }
+                    .frame(maxWidth: .infinity)
+                    .disabled(contacts.isLoading || filteredRecipients.isEmpty)
+
+                    Button {
+                        contacts.load()
+                    } label: {
+                        Label("Refresh", systemImage: "arrow.clockwise")
+                    }
+                    .disabled(contacts.isLoading)
+                }
+            }
+
+            HStack(spacing: 10) {
+                Button {
+                    dictation.toggle()
+                } label: {
+                    Label(dictation.isRecording ? "Stop Dictation" : "Dictate", systemImage: dictation.isRecording ? "stop.circle" : "mic")
+                }
+                .disabled(isSending)
+
+                if contacts.isLoading || dictation.isRecording {
+                    HStack(spacing: 8) {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text(dictation.isRecording ? "Listening..." : "Loading contacts...")
+                    }
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                }
+
+                Spacer()
+            }
+
+            if let errorMessage = contacts.errorMessage ?? dictation.errorMessage {
+                Text(errorMessage)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Text("OK sends this message to the selected contact, creates a Connecteam quick task, and marks the original thread as read.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            HStack {
+                Spacer()
+                Button("Cancel") {
+                    dictation.stop()
+                    onCancel()
+                }
+                .keyboardShortcut(.cancelAction)
+
+                Button("OK") {
+                    dictation.stop()
+                    onSend()
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(
+                    isSending
+                        || message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                        || selectedRecipient == nil
+                )
+            }
+        }
+        .padding(24)
+        .frame(width: 600)
+        .task {
+            contacts.load()
+        }
+        .onChange(of: dictation.dictatedText) { _, dictatedText in
+            guard !dictatedText.isEmpty else { return }
+            message = dictatedText
+        }
+        .onDisappear {
+            dictation.stop()
+        }
+    }
+}
+
 struct ActionRequiredControls: View {
     let thread: MessageThread
     @Binding var replyState: ThreadReplyState
@@ -1898,6 +2201,13 @@ struct ActionRequiredControls: View {
     @AppStorage(ResponseSettings.notStartedKey) private var notStartedMessage = ResponseSettings.notStartedDefault
     @AppStorage(ResponseSettings.yesKey) private var yesMessage = ResponseSettings.yesDefault
     @AppStorage(ResponseSettings.noKey) private var noMessage = ResponseSettings.noDefault
+    @AppStorage(ConnecteamSettings.apiKeyKey) private var connecteamAPIKey = ""
+    @AppStorage(ConnecteamSettings.taskBoardIDKey) private var connecteamTaskBoardID = ""
+    @AppStorage(ConnecteamSettings.userIDsKey) private var connecteamUserIDs = ""
+    @State private var isShowingDiscussSheet = false
+    @State private var discussDraft = ""
+    @State private var selectedDiscussRecipient: ContactRecipient?
+    @State private var connecteamAPIError: PermissionPrompt?
     private let actionColumns = [GridItem(.adaptive(minimum: 128), spacing: 8)]
 
     var body: some View {
@@ -1913,7 +2223,7 @@ struct ActionRequiredControls: View {
                         Label(action.rawValue, systemImage: action.iconName)
                             .frame(maxWidth: .infinity, alignment: .leading)
                     }
-                    .disabled(isSending || !thread.canReply)
+                    .disabled(isSending || (action != .discuss && !thread.canReply))
                 }
             }
 
@@ -1945,6 +2255,26 @@ struct ActionRequiredControls: View {
         }
         .padding(12)
         .background(.quaternary, in: RoundedRectangle(cornerRadius: 8))
+        .alert(item: $connecteamAPIError) { prompt in
+            Alert(
+                title: Text(prompt.title),
+                message: Text(prompt.message),
+                dismissButton: .default(Text("OK"))
+            )
+        }
+        .sheet(isPresented: $isShowingDiscussSheet) {
+            DiscussResponseSheet(
+                message: $discussDraft,
+                selectedRecipient: $selectedDiscussRecipient,
+                isSending: isSending,
+                onCancel: {
+                    isShowingDiscussSheet = false
+                },
+                onSend: {
+                    sendDiscuss()
+                }
+            )
+        }
     }
 
     private var isSending: Bool {
@@ -1956,6 +2286,13 @@ struct ActionRequiredControls: View {
     }
 
     private func send(_ action: ThreadResponseAction) {
+        if action == .discuss {
+            discussDraft = discussMessage
+            selectedDiscussRecipient = nil
+            isShowingDiscussSheet = true
+            return
+        }
+
         let message = action.message(
             approve: approveMessage,
             reject: rejectMessage,
@@ -1980,6 +2317,45 @@ struct ActionRequiredControls: View {
                 onThreadHandled()
                 replyState = .sent(action.rawValue)
             } catch {
+                replyState = .failed(error.localizedDescription)
+            }
+        }
+    }
+
+    private func sendDiscuss() {
+        let message = discussDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !message.isEmpty else {
+            replyState = .failed("Enter a discuss message before sending.")
+            return
+        }
+
+        guard let recipient = selectedDiscussRecipient else {
+            replyState = .failed("Select a contact before sending the discuss message.")
+            return
+        }
+
+        let settings = ConnecteamTaskSettings(
+            apiKey: connecteamAPIKey,
+            taskBoardID: connecteamTaskBoardID,
+            userIDsText: connecteamUserIDs
+        )
+
+        isShowingDiscussSheet = false
+        replyState = .sending(ThreadResponseAction.discuss.rawValue)
+        Task {
+            do {
+                try await ThreadReplySender.send(message: message, to: recipient)
+                try await ConnecteamTaskCreator.createDiscussTask(thread: thread, message: message, recipient: recipient, settings: settings)
+                try await ThreadReadMarker.markRead(thread)
+                onThreadHandled()
+                replyState = .sent(ThreadResponseAction.discuss.rawValue)
+            } catch {
+                if error is ConnecteamTaskError || (error as NSError).domain == NSURLErrorDomain {
+                    connecteamAPIError = PermissionPrompt(
+                        title: "Connecteam API Error",
+                        message: error.localizedDescription
+                    )
+                }
                 replyState = .failed(error.localizedDescription)
             }
         }
@@ -2229,6 +2605,208 @@ enum ThreadReplyError: LocalizedError {
     }
 }
 
+enum ConnecteamTaskError: LocalizedError {
+    case missingAPIKey
+    case missingTaskBoardID
+    case assigneeNotFound(String)
+    case invalidResponse(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .missingAPIKey:
+            return "Add your Connecteam API key in Settings before creating a quick task."
+        case .missingTaskBoardID:
+            return "Add your Connecteam task board ID in Settings before creating a quick task."
+        case .assigneeNotFound(let handle):
+            return "Connecteam did not find an active user matching \(handle). Check that the selected contact phone/email matches the user in Connecteam, or add a fallback user ID in Settings."
+        case .invalidResponse(let message):
+            return "Connecteam could not create the quick task: \(message)"
+        }
+    }
+}
+
+struct ConnecteamTaskSettings {
+    let apiKey: String
+    let taskBoardID: String
+    let userIDs: [Int]
+
+    init(apiKey: String, taskBoardID: String, userIDsText: String) {
+        self.apiKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.taskBoardID = taskBoardID.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.userIDs = userIDsText
+            .split(separator: ",")
+            .compactMap { Int($0.trimmingCharacters(in: .whitespacesAndNewlines)) }
+            .filter { $0 >= 1 }
+    }
+}
+
+enum ConnecteamTaskCreator {
+    static func createDiscussTask(thread: MessageThread, message: String, recipient: ContactRecipient, settings: ConnecteamTaskSettings) async throws {
+        guard !settings.apiKey.isEmpty else { throw ConnecteamTaskError.missingAPIKey }
+        guard !settings.taskBoardID.isEmpty else { throw ConnecteamTaskError.missingTaskBoardID }
+
+        let assigneeIDs = try await lookupUserIDs(for: recipient, apiKey: settings.apiKey)
+        let userIDs = assigneeIDs.isEmpty ? settings.userIDs : assigneeIDs
+        guard !userIDs.isEmpty else {
+            throw ConnecteamTaskError.assigneeNotFound(recipient.handle)
+        }
+
+        let title = "Discuss: \(thread.sender)"
+        let participantList = thread.participants.joined(separator: ", ")
+        let description = [
+            "ThreadPilot discuss action:",
+            message,
+            "Participants: \(participantList.isEmpty ? "Unknown" : participantList)"
+        ].joined(separator: "\n")
+
+        let url = URL(string: "https://api.connecteam.com/tasks/v1/taskboards/\(settings.taskBoardID)/tasks")!
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue(settings.apiKey, forHTTPHeaderField: "X-API-KEY")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.httpBody = try JSONSerialization.data(withJSONObject: [
+            "title": title,
+            "userIds": userIDs,
+            "status": "published",
+            "type": "oneTime",
+            "description": [
+                "content": description
+            ]
+        ])
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw ConnecteamTaskError.invalidResponse("No HTTP response was returned.")
+        }
+
+        guard (200..<300).contains(httpResponse.statusCode) else {
+            let responseText = String(data: data, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            throw ConnecteamTaskError.invalidResponse(responseText?.isEmpty == false ? responseText! : "HTTP \(httpResponse.statusCode)")
+        }
+    }
+
+    private static func lookupUserIDs(for recipient: ContactRecipient, apiKey: String) async throws -> [Int] {
+        let trimmedHandle = recipient.handle.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedHandle.isEmpty else { return [] }
+
+        var components = URLComponents(string: "https://api.connecteam.com/users/v1/users")!
+        var queryItems: [(String, String)] = [
+            ("limit", "10"),
+            ("userStatus", "active")
+        ]
+        let lookupValue: String
+
+        if trimmedHandle.contains("@") {
+            lookupValue = trimmedHandle.lowercased()
+            queryItems.append(("emailAddresses", lookupValue))
+        } else if let phoneNumber = connecteamPhoneNumber(for: trimmedHandle) {
+            lookupValue = phoneNumber
+            queryItems.append(("phoneNumbers", lookupValue))
+        } else {
+            return []
+        }
+
+        components.percentEncodedQuery = queryItems
+            .map { "\($0.0.urlQueryEncoded)=\($0.1.urlQueryEncoded)" }
+            .joined(separator: "&")
+        guard let url = components.url else {
+            throw ConnecteamTaskError.invalidResponse("Could not build Connecteam lookup URL for \(lookupValue).")
+        }
+
+        var request = URLRequest(url: url)
+        request.setValue(apiKey, forHTTPHeaderField: "X-API-KEY")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw ConnecteamTaskError.invalidResponse("No HTTP response was returned while looking up the assignee.")
+        }
+
+        guard (200..<300).contains(httpResponse.statusCode) else {
+            let responseText = String(data: data, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let fallback = "HTTP \(httpResponse.statusCode) while looking up assignee with \(lookupValue)"
+            throw ConnecteamTaskError.invalidResponse(responseText?.isEmpty == false ? responseText! : fallback)
+        }
+
+        let object = try JSONSerialization.jsonObject(with: data)
+        let userIDs = uniqueUserIDs(from: object)
+        guard userIDs.allSatisfy({ $0 >= 1 }) else {
+            throw ConnecteamTaskError.invalidResponse("Connecteam returned an invalid user ID while looking up \(lookupValue).")
+        }
+
+        return userIDs
+    }
+
+    private static func connecteamPhoneNumber(for value: String) -> String? {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        let digits = String(trimmed.unicodeScalars.filter { CharacterSet.decimalDigits.contains($0) })
+
+        guard !digits.isEmpty else { return nil }
+
+        if trimmed.hasPrefix("+") {
+            return "+\(digits)"
+        }
+
+        if digits.count == 10 {
+            return "+1\(digits)"
+        }
+
+        if digits.count == 11, digits.hasPrefix("1") {
+            return "+\(digits)"
+        }
+
+        return "+\(digits)"
+    }
+
+    fileprivate static let urlQueryAllowedWithoutPlus: CharacterSet = {
+        var allowed = CharacterSet.urlQueryAllowed
+        allowed.remove(charactersIn: "+&=")
+        return allowed
+    }()
+
+    private static func uniqueUserIDs(from object: Any) -> [Int] {
+        var ids: [Int] = []
+
+        func collect(from value: Any) {
+            if let dictionary = value as? [String: Any] {
+                for key in ["userId", "userID", "user_id"] {
+                    if let id = dictionary[key] as? Int {
+                        ids.append(id)
+                    } else if let idText = dictionary[key] as? String, let id = Int(idText) {
+                        ids.append(id)
+                    }
+                }
+
+                for child in dictionary.values {
+                    collect(from: child)
+                }
+            } else if let array = value as? [Any] {
+                for child in array {
+                    collect(from: child)
+                }
+            }
+        }
+
+        collect(from: object)
+
+        var seen = Set<Int>()
+        return ids.filter { id in
+            guard id >= 1, !seen.contains(id) else { return false }
+            seen.insert(id)
+            return true
+        }
+    }
+}
+
+private extension String {
+    var urlQueryEncoded: String {
+        addingPercentEncoding(withAllowedCharacters: ConnecteamTaskCreator.urlQueryAllowedWithoutPlus) ?? self
+    }
+}
+
 enum ThreadReadMarker {
     static func markRead(_ thread: MessageThread) async throws {
         try await Task.detached {
@@ -2239,8 +2817,21 @@ enum ThreadReadMarker {
 
 enum ThreadReplySender {
     static func send(message: String, to thread: MessageThread) async throws {
+        guard let recipient = thread.replyHandles.first(where: { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }) else {
+            throw ThreadReplyError.missingRecipient
+        }
+
+        try await send(message: message, chatIdentifier: thread.id, recipientHandle: recipient)
+    }
+
+    static func send(message: String, to recipient: ContactRecipient) async throws {
+        try await send(message: message, chatIdentifier: "", recipientHandle: recipient.handle)
+    }
+
+    private static func send(message: String, chatIdentifier: String, recipientHandle: String) async throws {
         try await Task.detached {
-            guard let recipient = thread.replyHandles.first(where: { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }) else {
+            let trimmedRecipient = recipientHandle.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmedRecipient.isEmpty else {
                 throw ThreadReplyError.missingRecipient
             }
 
@@ -2271,7 +2862,7 @@ enum ThreadReplySender {
 
             let process = Process()
             process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-            process.arguments = ["-e", script, "--", message, thread.id, recipient]
+            process.arguments = ["-e", script, "--", message, chatIdentifier, trimmedRecipient]
 
             let outputPipe = Pipe()
             let errorPipe = Pipe()

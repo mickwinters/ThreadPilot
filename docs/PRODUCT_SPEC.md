@@ -14,6 +14,7 @@ Busy professionals, founders, caregivers, operators, and anyone whose personal M
 - Categorize threads into Action Required, Opportunities, and Noise.
 - Summarize long threads without losing the reason they matter.
 - Extract follow-up actions, dates, commitments, money mentions, links, addresses, and open questions.
+- Provide configurable quick actions for replies, discussion handoffs, and task creation.
 - Let users mark the categorization as correct or incorrect to improve future triage.
 
 ## Acceptance Criteria
@@ -21,13 +22,15 @@ Busy professionals, founders, caregivers, operators, and anyone whose personal M
 - The app can ingest sample message-thread data from a local fixture.
 - The app shows categorized thread groups.
 - Each thread displays unread count, summary, suggested action, and confidence.
+- Action Required threads support a Discuss flow that sends a typed or dictated message to a selected contact, looks up the matching Connecteam user by phone number or email, and creates an assigned Connecteam quick task.
+- Settings include configurable quick-response messages and masked Connecteam API-key entry.
 - The app design does not imply automatic iPhone Messages access.
 - Any direct macOS Messages access is presented as an advanced, permissioned mode.
 - Cloud AI processing is opt-in and clearly labeled.
 
 ## Non-Goals
 
-- Sending messages on the user's behalf.
+- Sending messages without explicit user action.
 - Secretly reading Messages without permission.
 - iOS automatic full-history scanning.
 - Replacing Apple Messages as the primary messaging client.
